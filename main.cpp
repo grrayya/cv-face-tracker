@@ -1,78 +1,113 @@
-#include <opencv2/opencv.hpp>
 #include <iostream>
 #include <string>
+#include <thread>
+#include <vector>
+#include <mutex>
+#include <algorithm>
+#include <sys/socket.h>
+#include <arpa/inet.h>
+#include <unistd.h>
+#include <cstring>
+
+constexpr int PORT = 8080;
+
+std::vector<int> active_clients;
+std::mutex client_mutex; // Protects the active_clients vector from race conditions
+
+// Safely send a message to all connected clients except the sender
+void broadcast(const std::string& message, int sender_fd) {
+    std::lock_guard<std::mutex> lock(client_mutex);
+    for (int client_fd : active_clients) {
+        if (client_fd != sender_fd) {
+            send(client_fd, message.c_str(), message.length(), 0);
+        }
+    }
+}
+
+// The infinite loop that runs on a separate thread for EVERY connected client
+void handle_client(int client_fd) {
+    char buffer[1024];
+    std::string welcome = "New user joined the server.\n";
+    broadcast(welcome, client_fd);
+
+    while (true) {
+        memset(buffer, 0, sizeof(buffer));
+        int bytes_received = recv(client_fd, buffer, sizeof(buffer), 0);
+        
+        // If recv returns 0, the client disconnected cleanly. If < 0, an error occurred.
+        if (bytes_received <= 0) {
+            std::cout << "Client disconnected (FD: " << client_fd << ")" << std::endl;
+            close(client_fd);
+            
+            // Safely remove the client from our active list
+            std::lock_guard<std::mutex> lock(client_mutex);
+            active_clients.erase(std::remove(active_clients.begin(), active_clients.end(), client_fd), active_clients.end());
+            
+            broadcast("A user left the server.\n", -1);
+            break;
+        }
+        
+        std::string msg(buffer, bytes_received);
+        std::cout << "Received from FD " << client_fd << ": " << msg;
+        broadcast(msg, client_fd);
+    }
+}
 
 int main() {
-    // 1. Load the pre-trained face detection model
-    cv::CascadeClassifier face_cascade;
-    if (!face_cascade.load("haarcascade_frontalface_default.xml")) {
-        std::cerr << "Error: Could not load the cascade classifier XML file." << std::endl;
-        std::cerr << "Ensure 'haarcascade_frontalface_default.xml' is in the current directory." << std::endl;
+    // 1. Create a raw TCP/IPv4 socket
+    int server_fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (server_fd == -1) {
+        std::cerr << "Failed to create socket." << std::endl;
         return -1;
     }
 
-    // 2. Open the default system camera (index 0)
-    cv::VideoCapture cap(0);
-    if (!cap.isOpened()) {
-        std::cerr << "Error: Could not open the webcam." << std::endl;
+    // 2. Allow the port to be reused immediately after the server closes
+    int opt = 1;
+    setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+
+    // 3. Bind the socket to port 8080
+    sockaddr_in server_addr{};
+    server_addr.sin_family = AF_INET;
+    server_addr.sin_addr.s_addr = INADDR_ANY;
+    server_addr.sin_port = htons(PORT);
+
+    if (bind(server_fd, (struct sockaddr*)&server_addr, sizeof(server_addr)) < 0) {
+        std::cerr << "Bind failed. Is port " << PORT << " in use?" << std::endl;
         return -1;
     }
 
-    cv::Mat frame, gray;
-    std::cout << "Starting video stream..." << std::endl;
-    std::cout << "Controls: Press 's' to save a snapshot, 'ESC' to exit." << std::endl;
+    // 4. Start listening for incoming connections
+    if (listen(server_fd, 10) < 0) {
+        std::cerr << "Listen failed." << std::endl;
+        return -1;
+    }
 
-    double timer;
-    double fps;
+    std::cout << "🚀 TCP Relay Server listening on port " << PORT << "..." << std::endl;
 
-    // 3. Process the video stream frame by frame
+    // 5. Infinite loop to accept new clients
     while (true) {
-        timer = (double)cv::getTickCount(); // Start performance timer
+        sockaddr_in client_addr{};
+        socklen_t client_len = sizeof(client_addr);
+        int client_fd = accept(server_fd, (struct sockaddr*)&client_addr, &client_len);
         
-        cap >> frame; // Capture a new frame
-        if (frame.empty()) {
-            std::cerr << "Error: Dropped frame." << std::endl;
-            break;
+        if (client_fd < 0) {
+            std::cerr << "Failed to accept connection." << std::endl;
+            continue;
         }
 
-        // Convert to grayscale and equalize histogram for better contrast and speed
-        cv::cvtColor(frame, gray, cv::COLOR_BGR2GRAY);
-        cv::equalizeHist(gray, gray);
+        std::cout << "New connection accepted (FD: " << client_fd << ")" << std::endl;
 
-        // Detect faces (image, objects, scaleFactor, minNeighbors, flags, minSize)
-        std::vector<cv::Rect> faces;
-        face_cascade.detectMultiScale(gray, faces, 1.1, 4, 0, cv::Size(30, 30));
-
-        // Draw a bounding box around each detected face
-        for (const auto& face : faces) {
-            cv::rectangle(frame, face, cv::Scalar(255, 0, 0), 2); // Blue box
+        // Add client to our list safely
+        {
+            std::lock_guard<std::mutex> lock(client_mutex);
+            active_clients.push_back(client_fd);
         }
 
-        // Calculate and draw the FPS overlay
-        fps = cv::getTickFrequency() / ((double)cv::getTickCount() - timer);
-        cv::putText(frame, "FPS: " + std::to_string((int)fps), cv::Point(10, 30), 
-                    cv::FONT_HERSHEY_SIMPLEX, 1, cv::Scalar(0, 255, 0), 2);
-
-        // Display the live feed
-        cv::imshow("C++ Face Tracker", frame);
-
-        // 4. Handle user input
-        char key = (char)cv::waitKey(10);
-        
-        if (key == 27) { 
-            // ESC key pressed
-            break;
-        } 
-        else if (key == 's' || key == 'S') {
-            // Save snapshot on 's' press
-            std::string filename = "snapshot_" + std::to_string(cv::getTickCount()) + ".jpg";
-            cv::imwrite(filename, frame);
-            std::cout << "📸 Saved: " << filename << std::endl;
-        }
+        // Spawn a detached thread to handle this specific client
+        std::thread client_thread(handle_client, client_fd);
+        client_thread.detach(); 
     }
 
-    // 5. Clean up
-    cap.release();
-    cv::destroyAllWindows();
+    close(server_fd);
     return 0;
 }

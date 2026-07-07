@@ -1,0 +1,21 @@
+# CMake generated files and folders
+build/
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+Makefile
+
+# Compiled binaries
+face_tracker
+*.out
+*.o
+*.a
+*.so
+*.dylib
+
+# IDE specific folders
+.vscode/
+.idea/
+
+# Ignore the downloaded model to save repo space (optional, but good practice)
+*.xml

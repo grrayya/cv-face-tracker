@@ -1,106 +1,45 @@
+#include <opencv2/opencv.hpp>
 #include <iostream>
-#include <string>
-#include <thread>
 #include <vector>
-#include <mutex>
-#include <algorithm>
-#include <sys/socket.h>
-#include <arpa/inet.h>
-#include <unistd.h>
-#include <csignal>
-#include <chrono>
-
-const int PORT = 8080;
-const size_t MAX_USERS = 100;
-
-std::vector<int> clients;
-std::mutex mtx;
-volatile sig_atomic_t running = 1;
-
-void handle_sig(int) {
-    running = 0;
-}
-
-void broadcast(const std::string& msg, int sender) {
-    std::vector<int> targets;
-    {
-        std::lock_guard<std::mutex> lock(mtx);
-        targets = clients;
-    }
-
-    for (int fd : targets) {
-        if (fd != sender) {
-            if (send(fd, msg.c_str(), msg.length(), MSG_NOSIGNAL) < 0) {
-                std::cerr << "Send failed on FD " << fd << "\n";
-            }
-        }
-    }
-}
-
-void handle_client(int fd) {
-    char buf[1024];
-    broadcast("New user joined.\n", fd);
-
-    while (running) {
-        int bytes = recv(fd, buf, sizeof(buf), 0);
-        
-        if (bytes <= 0) {
-            close(fd);
-            {
-                std::lock_guard<std::mutex> lock(mtx);
-                clients.erase(std::remove(clients.begin(), clients.end(), fd), clients.end());
-            }
-            broadcast("User left.\n", -1);
-            break;
-        }
-        
-        // TCP is a byte stream. For production, buffer until '\n' is found.
-        broadcast(std::string(buf, bytes), fd);
-    }
-}
 
 int main() {
-    signal(SIGINT, handle_sig);
-    signal(SIGTERM, handle_sig);
-
-    int server = socket(AF_INET, SOCK_STREAM, 0);
-    int opt = 1;
-    setsockopt(server, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
-
-    sockaddr_in addr{};
-    addr.sin_family = AF_INET;
-    addr.sin_addr.s_addr = INADDR_ANY;
-    addr.sin_port = htons(PORT);
-
-    bind(server, (struct sockaddr*)&addr, sizeof(addr));
-    listen(server, 10);
-
-    std::cout << "Listening on " << PORT << "...\n";
-
-    while (running) {
-        int client = accept(server, nullptr, nullptr);
-        
-        if (client < 0) {
-            if (!running) break; 
-            std::this_thread::sleep_for(std::chrono::milliseconds(50));
-            continue;
-        }
-
-        {
-            std::lock_guard<std::mutex> lock(mtx);
-            if (clients.size() >= MAX_USERS) {
-                close(client);
-                continue;
-            }
-            clients.push_back(client);
-        }
-
-        std::thread(handle_client, client).detach();
+    cv::CascadeClassifier cascade;
+    
+    if (!cascade.load("haarcascade_frontalface_default.xml")) {
+        std::cerr << "Failed to load XML model.\n";
+        return -1;
     }
 
-    std::cout << "\nShutting down...\n";
-    close(server);
-    for (int fd : clients) close(fd);
-    
+    cv::VideoCapture cam(0);
+    if (!cam.isOpened()) {
+        std::cerr << "Cannot open webcam.\n";
+        return -1;
+    }
+
+    cv::Mat img, gray;
+
+    while (true) {
+        cam >> img;
+        if (img.empty()) break;
+
+        cv::cvtColor(img, gray, cv::COLOR_BGR2GRAY);
+        cv::equalizeHist(gray, gray);
+
+        std::vector<cv::Rect> faces;
+        cascade.detectMultiScale(gray, faces, 1.1, 4, 0, cv::Size(40, 40));
+
+        for (const auto& f : faces) {
+            cv::rectangle(img, f, cv::Scalar(0, 255, 0), 3);
+            cv::putText(img, "Target Locked", cv::Point(f.x, f.y - 10), 
+                        cv::FONT_HERSHEY_SIMPLEX, 0.6, cv::Scalar(0, 255, 0), 2);
+        }
+
+        cv::imshow("Face Tracker", img);
+
+        if (cv::waitKey(10) == 'q') {
+            break;
+        }
+    }
+
     return 0;
 }
